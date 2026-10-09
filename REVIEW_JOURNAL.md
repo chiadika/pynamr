@@ -174,6 +174,11 @@ may be intended, left unchanged, needs the owner's decision.
    Levels that would shrink the fixed image below 8 voxels are now dropped
    and at least ~5000 samples are drawn. Both rules are no-ops for the
    128^3-265^3 volumes the pipeline is meant for.
+3. **robustness** the same ITK error also comes from the optimiser: with the
+   upstream learning rate 0.2 (scales from physical shift) a coarse fixed image
+   (32^3 reduced in-vivo run) is thrown entirely out of overlap at the first
+   step. `align_images` now retries with the learning rate halved (up to 3
+   times) and reports it.
 
 ### pipeline.py (new) and the thin CLI
 

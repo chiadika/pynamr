@@ -41,17 +41,27 @@ def align_images(fixed_image: np.ndarray, moving_image: np.ndarray,
         n_vox = float(np.prod(fixed.GetSize()))
         reg.SetMetricSamplingPercentage(min(1.0, max(sampling_percentage, 5000.0 / n_vox)))
         reg.SetInterpolator(sitk.sitkLinear)
-        reg.SetOptimizerAsGradientDescentLineSearch(learningRate=learning_rate, numberOfIterations=iterations,
-                                                    convergenceMinimumValue=1e-7, convergenceWindowSize=10)
-        reg.SetOptimizerScalesFromPhysicalShift()
         # upstream pyramid [4, 2, 1]; levels that would shrink the fixed image below
         # 8 voxels are dropped (the MI metric fails when every sample maps outside)
         levels = [(f, s) for f, s in ((4, 2), (2, 1), (1, 0)) if min(fixed.GetSize()) // f >= 8]
         reg.SetShrinkFactorsPerLevel(shrinkFactors=[f for f, _ in levels])
         reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[s for _, s in levels])
         reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-        reg.SetInitialTransform(initial, inPlace=False)
-        final_transform = reg.Execute(sitk.Cast(fixed, sitk.sitkFloat32), sitk.Cast(moving, sitk.sitkFloat32))
+        # upstream's learning rate (0.2) can throw the moving image completely out of overlap on a coarse
+        # fixed image ("All samples map outside moving image buffer"); retry with smaller steps
+        for attempt, lr in enumerate([learning_rate / 2 ** i for i in range(4)]):
+            reg.SetOptimizerAsGradientDescentLineSearch(learningRate=lr, numberOfIterations=iterations,
+                                                        convergenceMinimumValue=1e-7, convergenceWindowSize=10)
+            reg.SetOptimizerScalesFromPhysicalShift()
+            reg.SetInitialTransform(initial, inPlace=False)
+            try:
+                final_transform = reg.Execute(sitk.Cast(fixed, sitk.sitkFloat32), sitk.Cast(moving, sitk.sitkFloat32))
+                break
+            except RuntimeError as err:
+                if "map outside" not in str(err) or attempt == 3:
+                    raise
+                if verbose:
+                    print(f"registration diverged with learning rate {lr:.3g}; retrying with {lr / 2:.3g}")
         if verbose:
             print(f"registration stopped: {reg.GetOptimizerStopConditionDescription()}")
             print(f"final metric value: {reg.GetMetricValue()}")

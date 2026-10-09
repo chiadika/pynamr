@@ -37,15 +37,16 @@ def align_images(fixed_image: np.ndarray, moving_image: np.ndarray,
         reg = sitk.ImageRegistrationMethod()
         reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
         reg.SetMetricSamplingStrategy(reg.RANDOM)
-        # at least ~5000 metric samples; a fixed 10 % fails on small (test) volumes
-        n_vox = float(np.prod(fixed.GetSize()))
-        reg.SetMetricSamplingPercentage(min(1.0, max(sampling_percentage, 5000.0 / n_vox)))
-        reg.SetInterpolator(sitk.sitkLinear)
         # upstream pyramid [4, 2, 1]; levels that would shrink the fixed image below
         # 8 voxels are dropped (the MI metric fails when every sample maps outside)
         levels = [(f, s) for f, s in ((4, 2), (2, 1), (1, 0)) if min(fixed.GetSize()) // f >= 8]
         reg.SetShrinkFactorsPerLevel(shrinkFactors=[f for f, _ in levels])
         reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[s for _, s in levels])
+        # at least ~5000 metric samples at the coarsest pyramid level; the fixed 10 % of upstream makes the
+        # MI metric lose every sample on small volumes (an in-vivo test at 32^3 failed even at 15 %)
+        n_vox = float(np.prod(fixed.GetSize())); f_max = max(f for f, _ in levels)
+        reg.SetMetricSamplingPercentage(min(1.0, max(sampling_percentage, 5000.0 * f_max ** 3 / n_vox)))
+        reg.SetInterpolator(sitk.sitkLinear)
         reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
         # upstream's learning rate (0.2) can throw the moving image completely out of overlap on a coarse
         # fixed image ("All samples map outside moving image buffer"); retry with smaller steps

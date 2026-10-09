@@ -22,6 +22,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import scipy.ndimage as ndimage
+import SimpleITK as sitk
 
 from .backend import BACKEND_NAME, to_device, to_numpy, xp
 from .coils_sens import calculate_csm_inati_iter, calculate_sense_scale
@@ -58,6 +59,7 @@ class ReconConfig:
     sodium_origin_mm: tuple[float, float, float] | None = None   # world origin of the recon grid; None = FOV centred at 0
     origin_from_anat: bool = False             # upstream behaviour: take the origin from the anatomical NIfTI
     anat_file: str = "anatomical_prior_image.nii"
+    skip_registration: bool = False            # prior already on the recon grid: resample with the identity transform only
     legacy_step_sizes: bool = False            # reproduce upstream PDHG steps
     legacy_init: bool = False                  # reproduce upstream: echo-2 AGR initialised with echo-1 SENSE recon
     save_intermediates: bool = False
@@ -238,7 +240,9 @@ def _stage_align_prior(cfg, out, na_img):
         na_origin = np.asarray(cfg.sodium_origin_mm, dtype=float)
     else:
         na_origin = -0.5 * (np.array(cfg.grid_shape) - 1) * cfg.voxel_size_mm   # FOV centred at the world origin
-    aligned, _ = align_images(na_img, anat_img, cfg.voxel_size_mm, na_origin, anat_voxsize, anat_origin)
+    final_transform = sitk.Euler3DTransform() if cfg.skip_registration else None
+    aligned, _ = align_images(na_img, anat_img, cfg.voxel_size_mm, na_origin, anat_voxsize, anat_origin,
+                              final_transform=final_transform)
     print(f"saving {aligned_path}")
     nib.save(nib.Nifti1Image(aligned.astype(np.float32), cfg.output_affine), aligned_path)
     return aligned

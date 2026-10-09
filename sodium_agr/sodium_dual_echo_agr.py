@@ -57,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csm_smoothing", type=int, default=d.csm_smoothing, help="box size of the coil-map smoothing")
     p.add_argument("--preview_matrix", type=int, default=d.preview_matrix, help="matrix of the gridding preview")
     p.add_argument("--anat_file", default=d.anat_file, help="anatomical prior NIfTI inside the subject directory")
+    p.add_argument("--skip_registration", action="store_true",
+                   help="do not register the prior; only resample it onto the recon grid with the identity transform "
+                        "(use when the prior was already resampled onto the sodium/UTE grid)")
     p.add_argument("--sodium_origin_mm", type=float, nargs=3, default=None, help="world origin (mm) of the recon grid; default FOV centred at 0")
     p.add_argument("--origin_from_anat", action="store_true", help="upstream behaviour: take the grid origin from the anatomical NIfTI")
     p.add_argument("--legacy_step_sizes", action="store_true", help="reproduce upstream PDHG step sizes")

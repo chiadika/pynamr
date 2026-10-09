@@ -50,6 +50,7 @@ class ReconConfig:
     lbfgs_iter: int = 10                       # L-BFGS iterations per outer iteration, stage 8
     num_time_bins: int = 64
     r_bounds: tuple[float, float] = (0.01, 1.0)
+    t2star_min_ms: float | None = None         # if set, the lower ratio bound becomes exp(-(TE2 - TE1) / t2star_min_ms)
     csm_smoothing: int = 7
     lsq_iter: int = 10
     preview_matrix: int = 64                   # gridding preview grid (upstream: fixed 64)
@@ -62,6 +63,21 @@ class ReconConfig:
     save_intermediates: bool = False
     output_subdir: str | None = None           # default: recon_<matrix>_<matrix>_<matrix>
     show_pbar: bool = False
+
+    @property
+    def effective_r_bounds(self) -> tuple[float, float]:
+        """Bounds of ``r = exp(-(TE2 - TE1) / T2*)``; ``t2star_min_ms`` overrides the lower one."""
+        if self.t2star_min_ms is None:
+            return tuple(self.r_bounds)
+        r_min = float(np.exp(-(self.TE2_ms - self.TE1_ms) / self.t2star_min_ms))
+        return (max(r_min, 1e-30), self.r_bounds[1])
+
+    @property
+    def t2star_bounds_ms(self) -> tuple[float, float]:
+        """The T2* range the ratio bounds correspond to (upper bound 1 means infinite T2*)."""
+        lo, hi = self.effective_r_bounds
+        d = self.TE2_ms - self.TE1_ms
+        return (-d / np.log(lo), np.inf if hi >= 1 else -d / np.log(hi))
 
     @property
     def grid_shape(self) -> tuple[int, int, int]:
@@ -131,6 +147,8 @@ def run(cfg: ReconConfig) -> dict:
     out.mkdir(exist_ok=True, parents=True)
     (out / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=1))
     print(f"backend: {BACKEND_NAME}; output: {out}")
+    lo, hi = cfg.effective_r_bounds; t_lo, t_hi = cfg.t2star_bounds_ms
+    print(f"ratio bounds {lo:.3g} .. {hi:.3g}  (T2* {t_lo:.3f} ms .. {t_hi:.3g} ms for dTE = {cfg.TE2_ms - cfg.TE1_ms:.3f} ms)")
     aff = cfg.output_affine
 
     data_1, data_2, k, params, dcf, norm = load_inputs(cfg)
@@ -253,7 +271,7 @@ def _stage_decay(data_1, data_2, params, maps_1, maps_2, k, x0, u0, r0, PG, cfg,
         data_1, data_2, params.sampling_time_us, cfg.TE1_ms, cfg.TE2_ms, maps_1, maps_2, k, x0=x0, u0=u0, r0=r0,
         G=PG, field_of_view_cm=cfg.fov_cm, regularization="L1", beta=cfg.beta_anatomical,
         max_iter=cfg.inner_iter_decay, max_outer_iter=cfg.max_outer_iter_agr, num_time_bins=cfg.num_time_bins,
-        beta_r=cfg.beta_r, r_bounds=cfg.r_bounds, lbfgs_iter=cfg.lbfgs_iter,
+        beta_r=cfg.beta_r, r_bounds=cfg.effective_r_bounds, lbfgs_iter=cfg.lbfgs_iter,
         legacy_step_sizes=cfg.legacy_step_sizes,
         intermediate_dir=(out / f"{name}_intermediates") if cfg.save_intermediates else None)
     nib.save(nib.Nifti1Image(np.abs(x).astype(np.float32), cfg.output_affine), out / f"{name}.nii")

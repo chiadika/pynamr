@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_time_bins", type=int, default=d.num_time_bins, help="readout time bins of the decay model")
     p.add_argument("--r_bounds", type=float, nargs=2, default=list(d.r_bounds), metavar=("RMIN", "RMAX"),
                    help="bounds of the ratio image exp(-dTE/T2*); lower it for short T2* (proton UTE)")
+    p.add_argument("--T2star_min_ms", dest="t2star_min_ms", type=float, default=None,
+                   help="shortest T2* to allow; sets the lower ratio bound to exp(-(TE2-TE1)/T2star_min_ms) and overrides RMIN")
     p.add_argument("--csm_smoothing", type=int, default=d.csm_smoothing, help="box size of the coil-map smoothing")
     p.add_argument("--preview_matrix", type=int, default=d.preview_matrix, help="matrix of the gridding preview")
     p.add_argument("--anat_file", default=d.anat_file, help="anatomical prior NIfTI inside the subject directory")

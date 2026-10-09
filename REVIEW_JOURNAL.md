@@ -273,5 +273,6 @@ with decay ratios 0.5 / 0.9 reconstructs to median ratios 0.51 / 0.91 after
 
 1. Second-echo AGR initialised with the first-echo L2 recon (master script line 479): typo or intended?
 2. Ratio lower bound 0.01 (reconstruction.py line 447): intended for sodium; it must be lowered for proton UTE.
+   The fork adds `--T2star_min_ms` (owner's choice for the in-vivo run: 0.05 ms, r_min = 9.6e-20 at dTE 2.19 ms).
 3. `na_origin = anat_origin` (master script line 414): a GE-layout assumption; the fork makes the origin explicit.
 4. The PDHG step rule: the fork's default follows the convergence condition; if the old iterates are wanted for continuity with published results, use `--legacy_step_sizes`.

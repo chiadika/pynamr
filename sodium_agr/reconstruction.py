@@ -215,6 +215,10 @@ def dual_echo_sense_with_decay_estimation(
     -----
     * ``x`` is the magnetisation at t = 0 (TE is part of the modelled decay), not at TE1.
     * ``r = exp(-(TE2 - TE1) / T2*)``; ``r_bounds`` must allow the shortest T2* of interest.
+      Very small lower bounds (1e-10 and below) are numerically fine for the forward model
+      (float32 holds 1e-38) but the gradient ``tau r**(tau-1)`` of the earliest bins
+      (tau << 1) grows like ``1 / r`` there, so L-BFGS-B steps are dominated by voxels at
+      the bound; the projected gradient is zero for voxels that want to go below it.
     * ``intermediate_dir`` receives ``r_<n>.npy`` / ``x_<n>.npy`` per outer iteration;
       upstream wrote them to a temporary directory that was deleted on return.
     """

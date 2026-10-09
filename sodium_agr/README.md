@@ -31,6 +31,10 @@ even when a GPU is present.
 
 Unit tests: `SODIUM_AGR_BACKEND=numpy pytest tests/test_sodium_agr.py` (from the repository root).
 
+`--T2star_min_ms` sets the lower bound of the ratio image from the shortest T2*
+you want to allow (`r_min = exp(-(TE2 - TE1) / T2star_min_ms)`); upstream's fixed
+0.01 corresponds to 0.48 ms for a 2.19 ms echo spacing.
+
 Re-running the master script resumes from the cached stage files in
 `<subject>/recon_<N>_<N>_<N>/`; delete a stage file to recompute it and
 everything after it. `--legacy_step_sizes --legacy_init` reproduce the

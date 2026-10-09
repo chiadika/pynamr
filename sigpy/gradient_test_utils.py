@@ -47,7 +47,7 @@ def cost_and_grad_wrapper(x, A, y, G, beta):
     
     # calculate the gradient
     grad_data_fidelity = A.H(delta)
-    grad_prior = 0.5 * G.H(G(x))
+    grad_prior = G.H(G(x))  # gradient of 0.5*||Gx||^2 is G^H G x (upstream had an extra 0.5)
     grad = grad_data_fidelity + beta * grad_prior
     
     # send complex gradient image to CPU

@@ -1,198 +1,97 @@
-"""utilities to estimate coil sensitivities, taken from https://github.com/ismrmrd/ismrmrd-python-tools/blob/master/ismrmrdtools/coils.py"""
-import numpy as np
-import cupy as cp
-from scipy import ndimage
+"""Coil sensitivity estimation (Inati et al., ISMRM 2014) and SENSE scaling.
 
+The Inati routine is a port of ismrmrd-python-tools / Gadgetron's
+``coil_map_3d_Inati_Iter``; it runs on numpy (the box smoothing dominates and
+is cheap at the grid sizes used here).
+"""
+from __future__ import annotations
+
+import numpy as np
 import sigpy
 import sigpy.mri
+from scipy import ndimage
+
+from .backend import device_of, to_device
 
 
-def calculate_sense_scale(coil_maps: np.ndarray, k: np.ndarray,
-                          data: np.ndarray, field_of_view_cm: float) -> float:
-    """calculate a scaling factor for the coil sensitivities such that the 
-       corresponding Sense operator has norm 1
-
-    Parameters
-    ----------
-    coil_maps : np.ndarray
-        array of coil sensitivity maps shape (num_coils, nx, ny, nz)
-    k : np.ndarray
-        array of k-space coordinates shape (..., 3)
-    data : np.ndarray
-        array of k-space data shape k.shape[:-1]
-    field_of_view_cm : float
-        field of view in cm
-
-    Returns
-    -------
-    float
-        scale by which the coil sensitivities can be divided to get scaled Sense Operator
-    """
-    k_d = cp.asarray(k.reshape(-1, 3)) * field_of_view_cm
-    d_d = cp.asarray(data.reshape(data.shape[0], -1))
-    S_tmp = sigpy.mri.linop.Sense(cp.asarray(coil_maps), coord=k_d)
-    max_eig = sigpy.app.MaxEig(S_tmp.H * S_tmp,
-                               dtype=d_d.dtype,
-                               device=k_d.device).run()
-
-    return np.sqrt(max_eig)
+def calculate_sense_scale(coil_maps: np.ndarray, k: np.ndarray, data: np.ndarray,
+                          field_of_view_cm: float, max_iter: int = 30) -> float:
+    """Scale by which the coil maps must be divided for the SENSE operator to have norm 1."""
+    k_d = to_device(np.asarray(k, dtype=np.float32).reshape(-1, 3) * float(field_of_view_cm))
+    S = sigpy.mri.linop.Sense(to_device(coil_maps), coord=k_d)
+    max_eig = sigpy.app.MaxEig(S.H * S, dtype=np.asarray(data).dtype, device=device_of(k_d),
+                               max_iter=max_iter, show_pbar=False).run()
+    return float(np.sqrt(float(max_eig)))
 
 
-def calculate_csm_inati_iter(im,
-                             smoothing=5,
-                             niter=5,
-                             thresh=1e-3,
-                             verbose=False):
-    """ Fast, iterative coil map estimation for 2D or 3D acquisitions.
+def smooth(img: np.ndarray, box=5) -> np.ndarray:
+    """Box-smooth a complex image (real and imaginary parts separately)."""
+    return (ndimage.uniform_filter(img.real, size=box) + 1j * ndimage.uniform_filter(img.imag, size=box))
+
+
+def calculate_csm_inati_iter(im, smoothing=5, niter: int = 5, thresh: float = 1e-3, verbose: bool = False):
+    """Fast iterative coil-map estimation and adaptive coil combination.
 
     Parameters
     ----------
-    im : ndarray
-        Input images, [coil, y, x] or [coil, z, y, x].
-    smoothing : int or ndarray-like
-        Smoothing block size(s) for the spatial axes.
-    niter : int
-        Maximal number of iterations to run.
-    thresh : float
-        Threshold on the relative coil map change required for early
-        termination of iterations.  If ``thresh=0``, the threshold check
-        will be skipped and all ``niter`` iterations will be performed.
-    verbose : bool
-        If true, progress information will be printed out at each iteration.
+    im : (ncoils, ny, nx) or (ncoils, nz, ny, nx) complex images
+    smoothing : int or 3 ints, box size of the spatial smoothing
+    niter, thresh : iterations and relative-change stopping threshold
 
     Returns
     -------
-    coil_map : ndarray
-        Relative coil sensitivity maps, [coil, y, x] or [coil, z, y, x].
-    coil_combined : ndarray
-        The coil combined image volume, [y, x] or [z, y, x].
-
-    Notes
-    -----
-    The implementation corresponds to the algorithm described in [1]_ and is a
-    port of Gadgetron's ``coil_map_3d_Inati_Iter`` routine.
-
-    For non-isotropic voxels it may be desirable to use non-uniform smoothing
-    kernel sizes, so a length 3 array of smoothings is also supported.
-
-    References
-    ----------
-    .. [1] S Inati, MS Hansen, P Kellman.  A Fast Optimal Method for Coil
-        Sensitivity Estimation and Adaptive Coil Combination for Complex
-        Images.  In: ISMRM proceedings; Milan, Italy; 2014; p. 4407.
+    coil_map : relative sensitivities, same shape as ``im``
+    coil_combined : the combined image
     """
-
     im = np.asarray(im)
     if im.ndim < 3 or im.ndim > 4:
-        raise ValueError("Expected 3D [ncoils, ny, nx] or 4D "
-                         " [ncoils, nz, ny, nx] input.")
-
-    if im.ndim == 3:
-        # pad to size 1 on z for 2D + coils case
-        images_are_2D = True
-        im = im[:, np.newaxis, :, :]
-    else:
-        images_are_2D = False
-
-    # convert smoothing kernel to array
-    if isinstance(smoothing, int):
-        smoothing = np.asarray([
-            smoothing,
-        ] * 3)
-    smoothing = np.asarray(smoothing)
-    if smoothing.ndim > 1 or smoothing.size != 3:
-        raise ValueError("smoothing should be an int or a 3-element 1D array")
-
-    if images_are_2D:
-        smoothing[2] = 1  # no smoothing along z in 2D case
-
-    # smoothing kernel is size 1 on the coil axis
-    smoothing = np.concatenate(([
-        1,
-    ], smoothing), axis=0)
-
+        raise ValueError("expected 3D [ncoils, ny, nx] or 4D [ncoils, nz, ny, nx] input")
+    images_are_2d = im.ndim == 3
+    if images_are_2d:
+        im = im[:, np.newaxis]
+    smoothing = np.asarray([smoothing] * 3 if np.ndim(smoothing) == 0 else smoothing)
+    if smoothing.size != 3:
+        raise ValueError("smoothing should be an int or 3 ints")
+    if images_are_2d:
+        smoothing[2] = 1
+    box = np.concatenate(([1], smoothing))
     ncha = im.shape[0]
-
-    try:
-        # numpy >= 1.7 required for this notation
-        D_sum = im.sum(axis=(1, 2, 3))
-    except:
-        D_sum = im.reshape(ncha, -1).sum(axis=1)
-
-    v = 1 / np.linalg.norm(D_sum)
-    D_sum *= v
-    R = 0
-
+    D_sum = im.sum(axis=(1, 2, 3))
+    D_sum *= 1.0 / np.linalg.norm(D_sum)
+    R = np.zeros(im.shape[1:], dtype=im.dtype)
     for cha in range(ncha):
-        R += np.conj(D_sum[cha]) * im[cha, ...]
-
+        R += np.conj(D_sum[cha]) * im[cha]
     eps = np.finfo(im.real.dtype).eps * np.abs(im).mean()
+    coil_map = None
     for it in range(niter):
         if verbose:
-            print("Coil map estimation: iteration %d of %d" % (it + 1, niter))
-        if thresh > 0:
-            prevR = R.copy()
+            print(f"coil map estimation: iteration {it + 1} of {niter}")
+        prevR = R.copy() if thresh > 0 else None
         R = np.conj(R)
-        coil_map = im * R[np.newaxis, ...]
-        coil_map_conv = smooth(coil_map, box=smoothing)
+        coil_map = im * R[np.newaxis]
+        coil_map_conv = smooth(coil_map, box=box)
         D = coil_map_conv * np.conj(coil_map_conv)
-        R = D.sum(axis=0)
-        R = np.sqrt(R) + eps
-        R = 1 / R
-        coil_map = coil_map_conv * R[np.newaxis, ...]
+        R = 1.0 / (np.sqrt(D.sum(axis=0)) + eps)
+        coil_map = coil_map_conv * R[np.newaxis]
         D = im * np.conj(coil_map)
         R = D.sum(axis=0)
-        D = coil_map * R[np.newaxis, ...]
-        try:
-            # numpy >= 1.7 required for this notation
-            D_sum = D.sum(axis=(1, 2, 3))
-        except:
-            D_sum = im.reshape(ncha, -1).sum(axis=1)
-        v = 1 / np.linalg.norm(D_sum)
-        D_sum *= v
-
-        imT = 0
+        D = coil_map * R[np.newaxis]
+        D_sum = D.sum(axis=(1, 2, 3))           # upstream's fallback branch summed `im` here by mistake
+        D_sum *= 1.0 / np.linalg.norm(D_sum)
+        imT = np.zeros(R.shape, dtype=im.dtype)
         for cha in range(ncha):
-            imT += np.conj(D_sum[cha]) * coil_map[cha, ...]
-        magT = np.abs(imT) + eps
-        imT /= magT
+            imT += np.conj(D_sum[cha]) * coil_map[cha]
+        imT /= np.abs(imT) + eps
         R = R * imT
-        imT = np.conj(imT)
-        coil_map = coil_map * imT[np.newaxis, ...]
-
+        coil_map = coil_map * np.conj(imT)[np.newaxis]
         if thresh > 0:
-            diffR = R - prevR
-            vRatio = np.linalg.norm(diffR) / np.linalg.norm(R)
+            vratio = np.linalg.norm(R - prevR) / np.linalg.norm(R)
             if verbose:
-                print("vRatio = {}".format(vRatio))
-            if vRatio < thresh:
+                print(f"  relative change {vratio:.3e}")
+            if vratio < thresh:
                 break
-
     coil_combined = (im * np.conj(coil_map)).sum(0)
-
-    if images_are_2D:
-        # remove singleton z dimension that was added for the 2D case
-        coil_combined = coil_combined[0, :, :]
-        coil_map = coil_map[:, 0, :, :]
-
+    if images_are_2d:
+        coil_combined = coil_combined[0]
+        coil_map = coil_map[:, 0]
     return coil_map, coil_combined
-
-
-def smooth(img, box=5):
-    '''Smooths coil images
-
-    :param img: Input complex images, ``[y, x] or [z, y, x]``
-    :param box: Smoothing block size (default ``5``)
-
-    :returns simg: Smoothed complex image ``[y,x] or [z,y,x]``
-    '''
-
-    t_real = np.zeros(img.shape)
-    t_imag = np.zeros(img.shape)
-
-    ndimage.filters.uniform_filter(img.real, size=box, output=t_real)
-    ndimage.filters.uniform_filter(img.imag, size=box, output=t_imag)
-
-    simg = t_real + 1j * t_imag
-
-    return simg

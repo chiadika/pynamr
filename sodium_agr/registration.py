@@ -1,96 +1,60 @@
+"""Rigid registration of the anatomical prior to the sodium/UTE image (SimpleITK, mutual information)."""
 from __future__ import annotations
+
+from typing import Sequence
 
 import numpy as np
 import SimpleITK as sitk
 
-from typing import Sequence, Union
 
-
-def numpy_volume_to_sitk_image(vol, voxel_size, origin):
-    image = sitk.GetImageFromArray(np.swapaxes(vol, 0, 2))
-    image.SetSpacing(voxel_size.astype(np.float64))
-    image.SetOrigin(origin.astype(np.float64))
-
+def numpy_volume_to_sitk_image(vol: np.ndarray, voxel_size: Sequence[float], origin: Sequence[float]) -> sitk.Image:
+    """numpy (x, y, z) volume -> sitk image with the given spacing and origin (mm)."""
+    image = sitk.GetImageFromArray(np.ascontiguousarray(np.swapaxes(vol, 0, 2)))
+    image.SetSpacing(np.asarray(voxel_size, dtype=np.float64).tolist())
+    image.SetOrigin(np.asarray(origin, dtype=np.float64).tolist())
     return image
 
 
-def sitk_image_to_numpy_volume(image):
-    vol = np.swapaxes(sitk.GetArrayFromImage(image), 0, 2)
-
-    return vol
+def sitk_image_to_numpy_volume(image: sitk.Image) -> np.ndarray:
+    return np.swapaxes(sitk.GetArrayFromImage(image), 0, 2)
 
 
-def align_images(fixed_image: np.ndarray,
-                 moving_image: np.ndarray,
-                 fixed_voxsize: Sequence[float] = (1., 1., 1.),
-                 fixed_origin: Sequence[float] = (0., 0., 0.),
-                 moving_voxsize: Sequence[float] = (1., 1., 1.),
-                 moving_origin: Sequence[float] = (0., 0., 0.),
-                 final_transform: sitk.Transform | None = None,
-                 verbose: bool = True):
+def align_images(fixed_image: np.ndarray, moving_image: np.ndarray,
+                 fixed_voxsize: Sequence[float] = (1.0, 1.0, 1.0), fixed_origin: Sequence[float] = (0.0, 0.0, 0.0),
+                 moving_voxsize: Sequence[float] = (1.0, 1.0, 1.0), moving_origin: Sequence[float] = (0.0, 0.0, 0.0),
+                 final_transform: sitk.Transform | None = None, verbose: bool = True,
+                 learning_rate: float = 0.2, iterations: int = 400, sampling_percentage: float = 0.1):
+    """Rigidly register ``moving_image`` onto ``fixed_image`` and resample it onto the fixed grid.
 
-    fixed_sitk_image = numpy_volume_to_sitk_image(
-        fixed_image.astype(np.float32), fixed_voxsize, fixed_origin)
-    moving_sitk_image = numpy_volume_to_sitk_image(
-        moving_image.astype(np.float32), moving_voxsize, moving_origin)
-
+    Returns ``(moving_image_aligned, transform)``. Passing ``final_transform``
+    skips the optimisation and only resamples.
+    """
+    fixed = numpy_volume_to_sitk_image(fixed_image.astype(np.float32), fixed_voxsize, fixed_origin)
+    moving = numpy_volume_to_sitk_image(moving_image.astype(np.float32), moving_voxsize, moving_origin)
     if final_transform is None:
-        # Initial Alignment
-        initial_transform = sitk.CenteredTransformInitializer(
-            fixed_sitk_image, moving_sitk_image, sitk.Euler3DTransform(),
-            sitk.CenteredTransformInitializerFilter.GEOMETRY)
-
-        # Registration
-        registration_method = sitk.ImageRegistrationMethod()
-
-        # Similarity metric settings.
-        registration_method.SetMetricAsMattesMutualInformation(
-            numberOfHistogramBins=50)
-        registration_method.SetMetricSamplingStrategy(
-            registration_method.RANDOM)
-        registration_method.SetMetricSamplingPercentage(0.1)
-
-        registration_method.SetInterpolator(sitk.sitkLinear)
-
-        # Optimizer settings.
-        registration_method.SetOptimizerAsGradientDescentLineSearch(
-            learningRate=0.2,
-            numberOfIterations=400,
-            convergenceMinimumValue=1e-7,
-            convergenceWindowSize=10)
-
-        registration_method.SetOptimizerScalesFromPhysicalShift()
-
-        # Setup for the multi-resolution framework.
-        registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-        registration_method.SetSmoothingSigmasPerLevel(
-            smoothingSigmas=[2, 1, 0])
-        registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-        # Don't optimize in-place, we would possibly like to run this cell multiple times.
-        registration_method.SetInitialTransform(initial_transform,
-                                                inPlace=False)
-
-        final_transform = registration_method.Execute(
-            sitk.Cast(fixed_sitk_image, sitk.sitkFloat32),
-            sitk.Cast(moving_sitk_image, sitk.sitkFloat32))
-
-        # Post registration analysis
+        initial = sitk.CenteredTransformInitializer(fixed, moving, sitk.Euler3DTransform(),
+                                                    sitk.CenteredTransformInitializerFilter.GEOMETRY)
+        reg = sitk.ImageRegistrationMethod()
+        reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+        reg.SetMetricSamplingStrategy(reg.RANDOM)
+        # at least ~5000 metric samples; a fixed 10 % fails on small (test) volumes
+        n_vox = float(np.prod(fixed.GetSize()))
+        reg.SetMetricSamplingPercentage(min(1.0, max(sampling_percentage, 5000.0 / n_vox)))
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetOptimizerAsGradientDescentLineSearch(learningRate=learning_rate, numberOfIterations=iterations,
+                                                    convergenceMinimumValue=1e-7, convergenceWindowSize=10)
+        reg.SetOptimizerScalesFromPhysicalShift()
+        # upstream pyramid [4, 2, 1]; levels that would shrink the fixed image below
+        # 8 voxels are dropped (the MI metric fails when every sample maps outside)
+        levels = [(f, s) for f, s in ((4, 2), (2, 1), (1, 0)) if min(fixed.GetSize()) // f >= 8]
+        reg.SetShrinkFactorsPerLevel(shrinkFactors=[f for f, _ in levels])
+        reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[s for _, s in levels])
+        reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        reg.SetInitialTransform(initial, inPlace=False)
+        final_transform = reg.Execute(sitk.Cast(fixed, sitk.sitkFloat32), sitk.Cast(moving, sitk.sitkFloat32))
         if verbose:
-            print(
-                f"Optimizer's stopping condition, {registration_method.GetOptimizerStopConditionDescription()}"
-            )
-            print(
-                f"Final metric value: {registration_method.GetMetricValue()}")
-            print(f"Final parameters: {final_transform.GetParameters()}")
-
-    moving_sitk_image_resampled = sitk.Resample(moving_sitk_image,
-                                                fixed_sitk_image,
-                                                final_transform,
-                                                sitk.sitkLinear, 0.0,
-                                                moving_sitk_image.GetPixelID())
-
-    moving_image_aligned = sitk_image_to_numpy_volume(
-        moving_sitk_image_resampled)
-
-    return moving_image_aligned, final_transform
+            print(f"registration stopped: {reg.GetOptimizerStopConditionDescription()}")
+            print(f"final metric value: {reg.GetMetricValue()}")
+            print(f"final parameters: {final_transform.GetParameters()}")
+    resampled = sitk.Resample(moving, fixed, final_transform, sitk.sitkLinear, 0.0, moving.GetPixelID())
+    return sitk_image_to_numpy_volume(resampled), final_transform

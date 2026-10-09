@@ -4,12 +4,16 @@ channels:
   - conda-forge
 
 dependencies:
-  - sigpy==0.1.25 # sigpy currently needs numpy < 1.20 (np.float issue)
-  - numpy<=1.19
-  - cupy<=10.6 # new cupy versions need numpy >= 1.20
+  - python>=3.10
+  - sigpy>=0.1.26
+  - numpy
+  - scipy
   - h5py>=3.0
   - matplotlib>=3.0
   - nibabel>=5.0
-  - pydantic==2.0
-  - scipy>=1.0
+  - numba
+  - pydantic>=2.0
   - SimpleITK>=2.0
+  - pytest
+  # GPU acceleration (optional; the package falls back to numpy without it).
+  # Install cupy matching the local CUDA, e.g. `conda install cupy` or `pip install cupy-cuda12x`.

@@ -7,10 +7,35 @@ Install conda (or mamba). All dependencies that are needed to run the reconstruc
 Create a new virtual conda environment that contains all our dependencies
 
 ```
-conda env create -f environment.yaml
+conda env create -f environment.yml
 ```
 
-**Since reconstructions are run on CUDA GPUs, the dependencies (cupy) can only be installed on systems with a CUDA capable GPU.**
+Reconstructions run on a CUDA GPU when `cupy` is installed (not part of the
+environment file; install the build matching your CUDA, e.g. `pip install
+cupy-cuda12x`). Without `cupy` the package falls back to numpy, which is
+correct but roughly 50-100x slower; `SODIUM_AGR_BACKEND=numpy` forces the CPU
+even when a GPU is present.
+
+### Package layout
+
+| module | content |
+| --- | --- |
+| `backend.py` | numpy/cupy selection (`xp`, `to_device`, `to_numpy`) |
+| `operators.py` | `ApodizedNUFFT` (time-binned decay-modelled NUFFT-SENSE), gradient / projected-gradient (dTV) operators, Bowsher gradient |
+| `reconstruction.py` | gridding, channel-wise LSQ, regularised SENSE (PDHG), joint dual-echo AGR with decay estimation |
+| `coils_sens.py` | Inati coil maps, SENSE scale |
+| `registration.py` | rigid MI registration of the anatomical prior (SimpleITK) |
+| `preprocessing.py` | GE TPI readers and the hdf5 writers/readers of the input layout below |
+| `pipeline.py` | `ReconConfig` + `run`: the eight cached stages |
+| `sodium_dual_echo_agr.py` | command-line entry point |
+
+Unit tests: `SODIUM_AGR_BACKEND=numpy pytest tests/test_sodium_agr.py` (from the repository root).
+
+Re-running the master script resumes from the cached stage files in
+`<subject>/recon_<N>_<N>_<N>/`; delete a stage file to recompute it and
+everything after it. `--legacy_step_sizes --legacy_init` reproduce the
+numerics of the original script (see `REVIEW_JOURNAL.md` at the repository
+root for what changed and why).
 
 ---
 
@@ -35,7 +60,7 @@ python sodium_dual_echo_agr.py -h
 ### Data preprocessing
 
 To preprocess raw non-uniform kspace data into the expected hdf5 file format, use the functions defined in the `preprocessing` module.
-See the top section of `sodium_dual_echo_agr.py` for me details.
+See the top section of `sodium_dual_echo_agr.py` for more details.
 
 **Structure of kspace_trajectory.h5**
 

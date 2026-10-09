@@ -1,492 +1,270 @@
+"""Reconstruction algorithms: gridding, channel-wise least squares, regularised
+SENSE (PDHG) and the alternating dual-echo AGR with decay estimation.
+
+All functions accept numpy inputs and run on the package backend (GPU when
+available). See ``REVIEW_JOURNAL.md`` (reconstruction.py items) for the changes
+versus upstream; the important one is the PDHG step rule.
+"""
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
+from typing import Callable
+
 import numpy as np
-import cupy as cp
 import sigpy
 import sigpy.mri
-
-from typing import Union
 from scipy.optimize import fmin_l_bfgs_b
 
-from operators import ApodizedNUFFT
-
-# custom type indicating a numpy or cupy array
-ndarray = Union[np.ndarray, cp.ndarray]
+from .backend import device_of, to_device, to_numpy, xp
+from .operators import ApodizedNUFFT, normalized_gradient_operator
 
 
-def channelwise_ifft_recon(data: np.ndarray,
-                           k: np.ndarray,
-                           dcf: np.ndarray,
-                           grid_shape=(64, 64, 64),
-                           field_of_view_cm=22.) -> np.ndarray:
-    """Channelwise gridding + IFFT recon of multi-coil data
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _coords(k, field_of_view_cm: float):
+    """(num_points*num_readouts, 3) k-space coordinates in grid units on the backend."""
+    return to_device(np.asarray(k, dtype=np.float32).reshape(-1, 3) * float(field_of_view_cm))
 
-    Parameters
-    ----------
-    data : np.ndarray
-        array of (non-uniform) kspace data of shape (num_coils, num_time_points, num_readouts)
-    k : np.ndarray
-        array containing the kspace coordinates of the readouts in 1/cm
-        shape (num_time_points, num_readouts, 3)
-    dcf : np.ndarray
-        sampling density compensation factor of shape (num_time_points, num_readouts)
-    grid_shape : tuple, optional
-        shape of the image grid , by default (64, 64, 64)
-    field_of_view_cm : _type_, optional
-        the field of view in cm, by default 22.
 
-    Returns
-    -------
-    np.ndarray
-        array of shape (num_coil, grid_shape)
+def operator_norm_squared(op: sigpy.linop.Linop, dtype, device, max_iter: int = 30) -> float:
+    """Largest eigenvalue of ``op.H * op`` by power iteration."""
+    return float(sigpy.app.MaxEig(op.H * op, dtype=dtype, device=device, max_iter=max_iter, show_pbar=False).run())
+
+
+def pdhg_step_sizes(sigma: float, norm_sq_stacked: float, safety: float = 0.99) -> tuple[float, float]:
+    """``(sigma, tau)`` satisfying ``sigma * tau * ||K||^2 = safety < 1``.
+
+    Upstream used ``tau = 0.99 * ||S||^2 / sigma`` (and ``0.99 * sigma / 1.5``
+    in the dual-echo code), which does not implement this condition.
     """
+    return float(sigma), safety / (float(sigma) * float(norm_sq_stacked))
 
-    # transfer k-space trajectory to GPU and convert to unitless
-    k_d = cp.asarray(k.reshape(-1, 3)) * field_of_view_cm
-    x_ifft_d = cp.zeros((data.shape[0], ) + grid_shape, dtype=data.dtype)
 
-    dcf_d = cp.asarray(dcf.ravel())
+def _prox_and_cost(regularization: str, beta: float, oshape):
+    if regularization == "L2":
+        prox = sigpy.prox.L2Reg(oshape, lamda=beta)
+        g = lambda z: float(beta * 0.5 * (z * z.conj()).sum().real)
+    elif regularization == "L1":
+        prox = sigpy.prox.L1Reg(oshape, lamda=beta)
+        g = lambda z: float(beta * abs(z).sum())
+    else:
+        raise ValueError("regularization must be 'L1' or 'L2'")
+    return prox, g
+
+
+# ---------------------------------------------------------------------------
+# simple reconstructions
+# ---------------------------------------------------------------------------
+def channelwise_ifft_recon(data: np.ndarray, k: np.ndarray, dcf: np.ndarray,
+                           grid_shape=(64, 64, 64), field_of_view_cm: float = 22.0) -> np.ndarray:
+    """Density-compensated gridding (adjoint NUFFT) per coil.
+
+    data : (num_coils, num_points, num_readouts) complex; k : (num_points, num_readouts, 3)
+    in 1/cm; dcf : (num_points, num_readouts). Returns (num_coils, *grid_shape).
+    """
+    coords = _coords(k, field_of_view_cm)
+    w = to_device(np.asarray(dcf, dtype=np.float32).ravel())
+    out = xp.zeros((data.shape[0],) + tuple(grid_shape), dtype=data.dtype)
     for i, d in enumerate(data):
-        # transfer data to GPU
-        d_d = cp.asarray(d.ravel())
-        x_ifft_d[i, ...] = sigpy.nufft_adjoint(d_d * dcf_d, k_d, grid_shape)
-
-    return cp.asnumpy(x_ifft_d)
+        out[i] = sigpy.nufft_adjoint(to_device(d.ravel()) * w, coords, tuple(grid_shape))
+    return to_numpy(out)
 
 
-#----------------------------------------------------------------
-
-
-def channelwise_lsq_recon(data: np.ndarray,
-                          k: np.ndarray,
-                          grid_shape=(64, 64, 64),
-                          field_of_view_cm=22.,
-                          max_iter=10,
-                          **kwargs) -> np.ndarray:
-    """Channelwise iterative least squares recon of multi-coil data
-
-    Parameters
-    ----------
-    data : np.ndarray
-        array of (non-uniform) kspace data of shape (num_coils, num_time_points, num_readouts)
-    k : np.ndarray
-        array containing the kspace coordinates of the readouts in 1/cm
-        shape (num_time_points, num_readouts, 3)
-    grid_shape : tuple, optional
-        shape of the image grid , by default (64, 64, 64)
-    field_of_view_cm : _type_, optional
-        the field of view in cm, by default 22.
-    max_iter : int
-        number of iterations, by default 10
-    **kwargs:
-        additional keyword arguments passed to sigpy.app.LinearLeastSquares
-
-    Returns
-    -------
-    np.ndarray
-        array of shape (num_coil, grid_shape)
-    """
-
-    # transfer k-space trajectory to GPU and convert to unitless
-    k_d = cp.asarray(k.reshape(-1, 3)) * field_of_view_cm
-    A = sigpy.linop.NUFFT(grid_shape, k_d)
-
-    x = cp.zeros((data.shape[0], ) + grid_shape, dtype=data.dtype)
-
+def channelwise_lsq_recon(data: np.ndarray, k: np.ndarray, grid_shape=(64, 64, 64),
+                          field_of_view_cm: float = 22.0, max_iter: int = 10, **kwargs) -> np.ndarray:
+    """Early-stopped conjugate-gradient least squares per coil (no regularisation)."""
+    coords = _coords(k, field_of_view_cm)
+    A = sigpy.linop.NUFFT(tuple(grid_shape), coords)
+    out = xp.zeros((data.shape[0],) + tuple(grid_shape), dtype=data.dtype)
     for i, d in enumerate(data):
-        # transfer data to GPU
-        d_d = cp.asarray(d.ravel())
-        alg = sigpy.app.LinearLeastSquares(A, d_d, max_iter=max_iter, **kwargs)
-        x[i, ...] = alg.run()
-
-    return cp.asnumpy(x)
+        out[i] = sigpy.app.LinearLeastSquares(A, to_device(d.ravel()), max_iter=max_iter,
+                                              show_pbar=False, **kwargs).run()
+    return to_numpy(out)
 
 
-#---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# regularised SENSE
+# ---------------------------------------------------------------------------
+def regularized_sense_recon(data: np.ndarray, coil_sens: np.ndarray, k: np.ndarray,
+                            field_of_view_cm: float = 22.0, regularization: str = "L2",
+                            beta: float = 1e-1, sigma: float = 1e-1,
+                            operator_norm_squared: float | None = None, max_iter: int = 100,
+                            G: sigpy.linop.Linop | None = None, u: np.ndarray | None = None,
+                            legacy_step_sizes: bool = False, show_pbar: bool = False,
+                            **kwargs) -> tuple[np.ndarray, np.ndarray]:
+    """Regularised SENSE reconstruction with PDHG.
 
-
-def regularized_sense_recon(data: np.ndarray,
-                            coil_sens: np.ndarray,
-                            k: np.ndarray,
-                            field_of_view_cm: float = 22.,
-                            regularization: str = 'L2',
-                            beta: float = 1e-1,
-                            sigma: float = 1e-1,
-                            operator_norm_squared: float | None = 1.,
-                            max_iter: int = 100,
-                            G: sigpy.linop.Linop | None = None,
-                            u: np.ndarray | None = None,
-                            **kwargs) -> tuple[np.ndarray, np.ndarray | None]:
-    """regularized iterative Sense recon of multicoil data
+    minimises ``0.5 ||S x - d||^2 + beta * g(G x)`` with ``g`` the L1 or squared L2 norm.
 
     Parameters
     ----------
-    data : np.ndarray
-        array of (non-uniform) kspace data of shape (num_coils, num_time_points, num_readouts)
-    coil_sens : np.ndarray
-        array of coil sensitivity maps of shape (num_coils, nx, ny, nz)
-    k : np.ndarray
-        array containing the kspace coordinates of the readouts in 1/cm
-        shape (num_time_points, num_readouts, 3)
-    field_of_view_cm : float, optional
-        the field of view in cm, by default 22.
-    regularization : str, optional
-        norm used for regularization ('L1' or 'L2'), by default 'L2'
-    beta : float, optional
-        regularization weight, by default 1e-1
-    sigma : float, optional
-        sigma step size for PDHG, by default 1e-1
-    operator_norm_squared : float | None, optional
-        squared norm of the operator used to calcucate 
-        tau step size in PDHG, by default 1.
-    max_iter : int, optional
-        maximum number of iterations, by default 100
-    G : sigpy.linop.Linop | None, optional
-        operator used for regularization, by default None
-    u : np.ndarray | None, optional
-        initial value of the dual variable in PDHG, by default None
+    data : (num_coils, num_points, num_readouts) complex
+    coil_sens : (num_coils, nx, ny, nz) complex, scaled so that ``||S|| = 1``
+    k : (num_points, num_readouts, 3) in 1/cm
+    G : gradient-like operator for the prior; default: normalised finite differences
+    u : initial dual variable (warm start)
+    operator_norm_squared : ``||[S; G]||^2``; estimated by power iteration when None
+    legacy_step_sizes : reproduce upstream's ``tau = 0.99 ||S||^2 / sigma``
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray | None]
-        single array containing the reconstructed image (if G is None)
-        or tuple of the reconstructed image and the dual variable u
-        (if G is not None)
+    (x, u) : reconstructed image and the final dual variable (both numpy)
     """
-    # send kspace trajectory and data to GPU
-    k_d = cp.asarray(k.reshape(-1, 3)) * field_of_view_cm
-    d_d = cp.asarray(data.reshape(data.shape[0], -1))
-
-    # setup normalize Sense operator
-    S = sigpy.mri.linop.Sense(cp.asarray(coil_sens), coord=k_d)
-
-    # setup normalized gradient operator
+    coords = _coords(k, field_of_view_cm)
+    d = to_device(data.reshape(data.shape[0], -1))
+    S = sigpy.mri.linop.Sense(to_device(coil_sens), coord=coords)
     if G is None:
-        G = (1 / np.sqrt(12)) * sigpy.linop.FiniteDifference(S.ishape)
+        G = normalized_gradient_operator(S.ishape)
+    prox, g = _prox_and_cost(regularization, beta, G.oshape)
 
-    # setup prox for gradient norm
-    if regularization == 'L2':
-        proxg = sigpy.prox.L2Reg(G.oshape, lamda=beta)
-        g = lambda z: float(beta * 0.5 * ((z * z.conj()).sum()).real)
-    elif regularization == 'L1':
-        proxg = sigpy.prox.L1Reg(G.oshape, lamda=beta)
-        g = lambda z: float(beta * cp.abs(z).sum())
+    if legacy_step_sizes:
+        norm_s = 1.0 if operator_norm_squared is None else operator_norm_squared
+        tau = 0.99 * norm_s / sigma
     else:
-        raise ValueError('regularization must be L1 or L2')
+        if operator_norm_squared is None:
+            K = sigpy.linop.Vstack([S, G])
+            operator_norm_squared = operator_norm_squared_of(K, d.dtype, device_of(coords))
+        sigma, tau = pdhg_step_sizes(sigma, operator_norm_squared)
 
-    if operator_norm_squared is None:
-        operator_norm_squared = sigpy.app.MaxEig(S.H * S,
-                                                 dtype=data.dtype,
-                                                 device=data.device).run()
-
-    app = sigpy.app.LinearLeastSquares(S,
-                                       d_d,
-                                       G=G,
-                                       proxg=proxg,
-                                       max_iter=max_iter,
-                                       sigma=sigma,
-                                       tau=0.99 * operator_norm_squared /
-                                       sigma,
-                                       g=g,
-                                       **kwargs)
-    if G is not None:
-        if u is not None:
-            app.alg.u = cp.asarray(u)
-
-    x = cp.asnumpy(app.run())
-
-    if G is not None:
-        return x, cp.asnumpy(app.alg.u)
-    else:
-        return x, None
+    app = sigpy.app.LinearLeastSquares(S, d, G=G, proxg=prox, max_iter=max_iter, sigma=sigma,
+                                       tau=tau, g=g, show_pbar=show_pbar, **kwargs)
+    if u is not None:
+        app.alg.u = to_device(u)
+    x = app.run()
+    return to_numpy(x), to_numpy(app.alg.u)
 
 
-#---------------------------------------------------------------
+def operator_norm_squared_of(op: sigpy.linop.Linop, dtype, device, max_iter: int = 30) -> float:
+    """``||op||^2`` by power iteration (small wrapper so callers need no sigpy details)."""
+    return operator_norm_squared(op, dtype, device, max_iter=max_iter)
 
 
-def data_fidelity_gradient_r(x: ndarray, A_1: ApodizedNUFFT,
-                             A_2: ApodizedNUFFT, d_1: ndarray,
-                             d_2: ndarray) -> ndarray:
-    """gradient with respect to the ratio image of the dual data fidelity
+# ---------------------------------------------------------------------------
+# dual-echo AGR with decay estimation
+# ---------------------------------------------------------------------------
+def build_time_binned_operators(coil_sens, k, field_of_view_cm: float, num_time_bins: int,
+                                sampling_time_us: float, TE_ms: float, delta_TE_ms: float):
+    """SENSE operators per time bin and their ``tau`` values for one echo.
 
-    Parameters
-    ----------
-    x : ndarray
-        containing the sodium image
-    A_1, A_2 : ApodizedNUFFT
-        apodized NUFFT operator for 1st / 2nd echo
-    d_1, d_2 : cp.ndarray
-        non-uniform data of 1st / 2nd echo
-
-    Returns
-    -------
-    ndarray
-        containg the gradient with respect to r
+    tau_i is the mean readout time of bin i (from excitation, TE included)
+    divided by the echo spacing, so the decay of bin i is ``r ** tau_i``.
     """
-    xp = sigpy.backend.get_array_module(x)
-    g_r = xp.zeros(A_1.ishape, dtype=A_1.r.dtype)
+    chunks = np.array_split(np.asarray(k, dtype=np.float32) * float(field_of_view_cm), num_time_bins, axis=0)
+    sens_d = to_device(coil_sens)
+    Flist = [sigpy.mri.linop.Sense(sens_d, to_device(c)) for c in chunks]
+    t_ms = np.arange(k.shape[0]) * sampling_time_us * 1e-3 + TE_ms
+    tau = [float(c.mean()) for c in np.array_split(t_ms / delta_TE_ms, num_time_bins)]
+    return Flist, tau
 
-    for i in range(A_1.num_time_bins):
-        inds = A_1.get_split_inds(i)
 
-        A_1i = A_1.get_Ai(i)
-        A_2i = A_2.get_Ai(i)
+def data_fidelity_gradient_r(x, A_1: ApodizedNUFFT, A_2: ApodizedNUFFT, d_1, d_2, residual_1=None, residual_2=None):
+    """Gradient of the dual data fidelity with respect to the ratio image.
 
-        g_r += A_1.tau[i] * (A_1.r**(A_1.tau[i] - 1)) * (
-            x.conj() * A_1i.H(A_1i(x) - d_1[:, inds, :])).real
-        g_r += A_2.tau[i] * (A_2.r**(A_2.tau[i] - 1)) * (
-            x.conj() * A_2i.H(A_2i(x) - d_2[:, inds, :])).real
+    ``d/dr 0.5||A_i(r) x - d_i||^2 = sum_bins tau_b r**(tau_b-1) Re( conj(x) F_b^H (F_b(r**tau_b x) - d_b) )``
 
+    ``residual_i = A_i x - d_i`` may be passed to avoid recomputing the forward model.
+    """
+    mod = A_1.xp
+    g_r = mod.zeros(tuple(A_1.ishape), dtype=A_1.r.dtype)
+    xc = x.conj()
+    for A, d, res in ((A_1, d_1, residual_1), (A_2, d_2, residual_2)):
+        for i in range(A.num_time_bins):
+            s = A.bin_slice(i)
+            r_i = res[:, s, :] if res is not None else A.F(i)(A.decay_power(i) * x) - d[:, s, :]
+            g_r += A.tau[i] * A.decay_power_minus_one(i) * (xc * A.F(i).H(r_i)).real
     return g_r
 
 
-#---------------------------------------------------------------
-def r_cost_wrapper(r_flat: np.ndarray, x: cp.ndarray, A_1: ApodizedNUFFT,
-                   A_2: ApodizedNUFFT, d_1: cp.ndarray, d_2: cp.ndarray,
-                   G: sigpy.linop.Linop, beta: float) -> float:
-    """wrapper around the data fidelity cost function that can be used
-       by scipy.optimize.fmin_l_bfgs_b
+def r_cost_and_gradient(r_flat: np.ndarray, x, A_1: ApodizedNUFFT, A_2: ApodizedNUFFT, d_1, d_2,
+                        G: sigpy.linop.Linop, beta_r: float) -> tuple[float, np.ndarray]:
+    """Cost and gradient for the L-BFGS update of the ratio image (one forward pass).
 
-    Parameters
-    ----------
-    r_flat : np.ndarray
-        flattened array containing the ratio image
-    x : cp.ndarray
-        array containing the sodium image
-    A_1, A_2 : ApodizedNUFFT
-        apodized NUFFT operator for 1st / 2nd echo
-    d_1, d_2 : cp.ndarray
-        non-uniform data of 1st / 2nd echo
-    G : sigpy.linop.Linop
-        linear operator used for regularization
-    beta : float
-        regularization weight
-
-    Returns
-    -------
-    float
-        the data fidelity
+    Upstream evaluated the forward model separately for the cost and for the
+    gradient; here the residual is shared, which halves the cost of each L-BFGS step.
     """
-    r_init = A_1.r.copy()
-    r = cp.asarray(r_flat.reshape(A_1.ishape))
+    r = to_device(r_flat.reshape(tuple(A_1.ishape)), dtype=A_1.r.dtype)
     A_1.r = r
     A_2.r = r
-
-    data_fid = 0.5 * float((cp.abs(A_1(x) - d_1)**2).sum() +
-                           (cp.abs(A_2(x) - d_2)**2).sum())
-    prior = 0.5 * beta * float((G(r)**2).sum())
-
-    A_1.r = r_init
-    A_2.r = r_init
-
-    return (data_fid + prior)
-
-
-def r_gradient_wrapper(r_flat: np.ndarray, x: cp.ndarray, A_1: ApodizedNUFFT,
-                       A_2: ApodizedNUFFT, d_1: cp.ndarray, d_2: cp.ndarray,
-                       G: sigpy.linop.Linop, beta: float) -> np.ndarray:
-    """wrapper around the r gradient data fidelity cost function that can be used
-       by scipy.optimize.fmin_l_bfgs_b
-
-    Parameters
-    ----------
-    r_flat : np.ndarray
-        flattened array containing the ratio image
-    x : cp.ndarray
-        array containing the sodium image
-    A_1, A_2 : ApodizedNUFFT
-        apodized NUFFT operator for 1st / 2nd echo
-    d_1, d_2 : cp.ndarray
-        non-uniform data of 1st / 2nd echo
-    G : sigpy.linop.Linop
-        linear operator used for regularization
-    beta : float
-        regularization weight
-
-    Returns
-    -------
-    np.ndarray
-        the (flattned) gradient of the data fidelity with respect to r
-    """
-
-    r_init = A_1.r.copy()
-    r = cp.asarray(r_flat.reshape(A_1.ishape))
-    A_1.r = r
-    A_2.r = r
-
-    data_grad = data_fidelity_gradient_r(x, A_1, A_2, d_1, d_2)
-    prior_grad = beta * G.H(G(r))
-
-    A_1.r = r_init
-    A_2.r = r_init
-
-    return cp.asnumpy((data_grad + prior_grad).ravel())
+    res_1 = A_1(x) - d_1
+    res_2 = A_2(x) - d_2
+    mod = A_1.xp
+    data_fid = 0.5 * float((mod.abs(res_1) ** 2).sum() + (mod.abs(res_2) ** 2).sum())
+    Gr = G(r)
+    prior = 0.5 * beta_r * float((mod.abs(Gr) ** 2).sum())
+    grad = data_fidelity_gradient_r(x, A_1, A_2, d_1, d_2, res_1, res_2) + beta_r * G.H(Gr).real
+    return data_fid + prior, to_numpy(grad).astype(np.float64).ravel()
 
 
 def dual_echo_sense_with_decay_estimation(
-        data_1: np.ndarray,
-        data_2: np.ndarray,
-        sampling_time_us: float,
-        TE1_ms: float,
-        TE2_ms: float,
-        coil_sens_1: np.ndarray,
-        coil_sens_2: np.ndarray,
-        k: np.ndarray,
-        x0: np.ndarray,
-        u0: np.ndarray,
-        r0: np.ndarray,
-        G: sigpy.linop.Linop,
-        field_of_view_cm=22.,
-        regularization: str = 'L1',
-        beta: float = 3e-3,
-        sigma: float = 1e-1,
-        max_iter: int = 100,
-        max_outer_iter: int = 20,
-        num_time_bins: int = 64,
-        beta_r: float = 1e-3,
-        save_intermed: bool = True,
+        data_1: np.ndarray, data_2: np.ndarray, sampling_time_us: float, TE1_ms: float, TE2_ms: float,
+        coil_sens_1: np.ndarray, coil_sens_2: np.ndarray, k: np.ndarray, x0: np.ndarray, u0: np.ndarray,
+        r0: np.ndarray, G: sigpy.linop.Linop, field_of_view_cm: float = 22.0, regularization: str = "L1",
+        beta: float = 3e-3, sigma: float = 1e-1, max_iter: int = 100, max_outer_iter: int = 20,
+        num_time_bins: int = 64, beta_r: float = 1e-3, r_bounds: tuple[float, float] = (0.01, 1.0),
+        lbfgs_iter: int = 10, operator_norm_squared: float | None = None, legacy_step_sizes: bool = False,
+        intermediate_dir: Path | str | None = None, callback: Callable | None = None, verbose: bool = True,
         **kwargs) -> tuple[np.ndarray, np.ndarray]:
-    """Dual echo AGR with T2* decay estimation and modeling
+    """Joint dual-echo AGR with mono-exponential decay estimation (alternating).
 
-    Parameters
-    ----------
-    data_1, data_2 : np.ndarray
-        non-uniform (TPI) complex kspace data
-        of shape (num_coils, num_time_points, num_readouts)
-    sampling_time_us : float
-        acquisition sampling time in microseconds
-    TE1_ms, TE2_ms : float
-        1st / 2nd echo time in milli seconds
-    coil_sens_1, coil_sens_2 : np.ndarray
-        coil sensitivity maps of shape (num_coils, nx, ny, nz)
-        for 1st / 2nd acquisition
-        note that these should include a phase factor that accounts
-        for the phase differences in the 1st / 2nd echo images
-    k : np.ndarray
-        array of kspace kooridnates of shape (num_time_points, num_readouts, 3)
-    x0 : np.ndarray
-        initial value for the image to be reconstructed
-    u0 : np.ndarray
-        initial value for the dual variable of the PDHG
-    r0 : np.ndarray
-        initial value for the ratio image between 2nd and 1st echo
-    G : sigpy.linop.Linop
-        "gradient" operator for the regularization
-        can be projector gradient to get AGRs
-    field_of_view_cm : _type_, optional
-        image field of view in cm, by default 22.
-    regularization : str, optional
-        norm used for image regularization ('L1' or 'L2'), by default 'L1'
-    beta : float, optional
-        weight for image prior, by default 3e-3
-    sigma : float, optional
-        sigma stepsize of PDHG, by default 1e-1
-    max_iter : int, optional
-        number of PDHG inner iterations to update the image, by default 100
-    max_outer_iter : int, optional
-        number of outer iterations, by default 20
-    num_time_bins : int, optional
-        number of time bins to model decay, by default 64
-    beta_r : float, optional
-        weight of L2 gradient prior for the ration image, by default 1e-3
-    save_intermed : bool, optional
-        save intermediate results in a temporary directory, by default True
+    Outer loop: (1) L-BFGS-B update of the ratio image ``r`` (bounded), (2) PDHG
+    update of the image ``x`` with the decay-modelled stacked operator
+    ``[A_1(r); A_2(r)]`` and the prior ``beta * ||G x||_1``.
 
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        the reconstructed image and the ratio image
+    Notes
+    -----
+    * ``x`` is the magnetisation at t = 0 (TE is part of the modelled decay), not at TE1.
+    * ``r = exp(-(TE2 - TE1) / T2*)``; ``r_bounds`` must allow the shortest T2* of interest.
+    * ``intermediate_dir`` receives ``r_<n>.npy`` / ``x_<n>.npy`` per outer iteration;
+      upstream wrote them to a temporary directory that was deleted on return.
     """
+    d_1 = to_device(data_1)
+    d_2 = to_device(data_2)
+    x = to_device(x0, dtype=d_1.dtype)
+    u = to_device(u0)
+    r = to_device(r0, dtype=np.float32 if d_1.dtype == np.complex64 else np.float64)
+    dTE = TE2_ms - TE1_ms
 
-    d_1 = cp.asarray(data_1)
-    d_2 = cp.asarray(data_2)
-
-    x = cp.asarray(x0)
-    u = cp.asarray(u0)
-    r = cp.asarray(r0)
-
-    Flist_1 = [
-        sigpy.mri.linop.Sense(cp.asarray(coil_sens_1), cp.asarray(kchunk)) for
-        kchunk in np.array_split(k * field_of_view_cm, num_time_bins, axis=0)
-    ]
-
-    Flist_2 = [
-        sigpy.mri.linop.Sense(cp.asarray(coil_sens_2), cp.asarray(kchunk)) for
-        kchunk in np.array_split(k * field_of_view_cm, num_time_bins, axis=0)
-    ]
-
-    t_read_1_ms = np.arange(k.shape[0]) * sampling_time_us * (1e-3) + TE1_ms
-    t_read_2_ms = np.arange(k.shape[0]) * sampling_time_us * (1e-3) + TE2_ms
-
-    tau_1 = [
-        x.mean()
-        for x in np.array_split(t_read_1_ms / (TE2_ms - TE1_ms), num_time_bins)
-    ]
-    tau_2 = [
-        x.mean()
-        for x in np.array_split(t_read_2_ms / (TE2_ms - TE1_ms), num_time_bins)
-    ]
-
+    Flist_1, tau_1 = build_time_binned_operators(coil_sens_1, k, field_of_view_cm, num_time_bins, sampling_time_us, TE1_ms, dTE)
+    Flist_2, tau_2 = build_time_binned_operators(coil_sens_2, k, field_of_view_cm, num_time_bins, sampling_time_us, TE2_ms, dTE)
     A_1 = ApodizedNUFFT(Flist_1, r, tau_1)
     A_2 = ApodizedNUFFT(Flist_2, r, tau_2)
+    prox, _ = _prox_and_cost(regularization, beta, G.oshape)
 
-    # setup prox for gradient norm
-    if regularization == 'L2':
-        proxg = sigpy.prox.L2Reg(G.oshape, lamda=beta)
-    elif regularization == 'L1':
-        proxg = sigpy.prox.L1Reg(G.oshape, lamda=beta)
-    else:
-        raise ValueError('regularization must be L1 or L2')
+    if intermediate_dir is not None:
+        intermediate_dir = Path(intermediate_dir)
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    if save_intermed:
-        tempdir = tempfile.TemporaryDirectory()
-        temppath = Path(tempdir.name)
-
-    r_bounds = r.size * [(0.01, 1)]
-
+    bounds = int(r.size) * [tuple(r_bounds)]
+    r_new = r
     for i_outer in range(max_outer_iter):
-        print(
-            f'dual echo AGR with decay est. outer iteration {(i_outer+1):03} / {max_outer_iter:03}'
-        )
-
-        # use L-BFGS_B to update the ratio image
-        rf = cp.asnumpy(A_1.r.copy()).flatten()
-        res = fmin_l_bfgs_b(r_cost_wrapper,
-                            rf,
-                            fprime=r_gradient_wrapper,
-                            args=(x, A_1, A_2, d_1, d_2, G, beta_r),
-                            maxiter=10,
-                            bounds=r_bounds,
-                            disp=1)
-
-        r_new = cp.asarray(res[0].reshape(A_1.ishape))
-
+        if verbose:
+            print(f"dual echo AGR with decay estimation, outer iteration {i_outer + 1:03d} / {max_outer_iter:03d}")
+        res = fmin_l_bfgs_b(r_cost_and_gradient, to_numpy(A_1.r).astype(np.float64).ravel(),
+                            args=(x, A_1, A_2, d_1, d_2, G, beta_r), maxiter=lbfgs_iter,
+                            bounds=bounds, disp=1 if verbose else 0)
+        r_new = to_device(res[0].reshape(tuple(A_1.ishape)), dtype=r.dtype)
         A_1.r = r_new
         A_2.r = r_new
 
-        #-----------------------------------------------------------------------
-        app = sigpy.app.LinearLeastSquares(sigpy.linop.Vstack([A_1, A_2],
-                                                              axis=0),
-                                           cp.concatenate((d_1, d_2), 0),
-                                           G=G,
-                                           proxg=proxg,
-                                           x=x,
-                                           max_iter=max_iter,
-                                           sigma=sigma,
-                                           tau=0.99 * sigma / 1.5,
-                                           **kwargs)
-
+        K = sigpy.linop.Vstack([A_1, A_2], axis=0)
+        if legacy_step_sizes:
+            tau = 0.99 * sigma / 1.5
+            sig = sigma
+        else:
+            norm_sq = operator_norm_squared if operator_norm_squared is not None else \
+                operator_norm_squared_of(sigpy.linop.Vstack([K, G]), d_1.dtype, device_of(d_1), max_iter=20)
+            sig, tau = pdhg_step_sizes(sigma, norm_sq)
+        app = sigpy.app.LinearLeastSquares(K, xp.concatenate((d_1, d_2), 0), G=G, proxg=prox, x=x,
+                                           max_iter=max_iter, sigma=sig, tau=tau, show_pbar=False, **kwargs)
         app.alg.u = u
         x = app.run()
-
-        # save the dual variable for the initialization of the next PDHG run
         u = app.alg.u.copy()
 
-        if save_intermed:
-            print(f'saving intermediate results to {temppath}')
-            cp.save(temppath / f'r_{i_outer+1}.npy', A_1.r)
-            cp.save(temppath / f'x_{i_outer+1}.npy', x)
+        if intermediate_dir is not None:
+            np.save(intermediate_dir / f"r_{i_outer + 1}.npy", to_numpy(A_1.r))
+            np.save(intermediate_dir / f"x_{i_outer + 1}.npy", to_numpy(x))
+        if callback is not None:
+            callback(i_outer, to_numpy(x), to_numpy(A_1.r))
 
-    return cp.asnumpy(x), cp.asnumpy(r_new)
+    return to_numpy(x), to_numpy(r_new)

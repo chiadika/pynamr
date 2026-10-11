@@ -236,6 +236,12 @@ adjoint 87 vs 72 s at 128^3, 2 coils, 2.5 M points per coil; full toy run
 segmentation promises needs an interpolation-free (Toeplitz) normal operator
 with a gradient-based x-update, which is a solver change. Keep
 `--decay_model segments` as the accurate option, not the fast one.
+The coarse masked ratio (`--r_coarse_factor 2 --r_mask`) on the same toy
+subject (32^3, ratio grid 16^3 = 15.6 mm) changed the result (ratio RMSE 0.33
+inside the object, image NRMSE 0.24) and was not faster (1408 s), so a factor
+2 is only meaningful at the real resolution (1.9 mm at 265^3); it needs the
+GPU run to be judged. The object mask was the whole volume at 32^3 (the
+difference data alias everywhere), so `--r_mask` did nothing there.
 
 ### tests/
 

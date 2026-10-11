@@ -39,7 +39,7 @@ you want to allow (`r_min = exp(-(TE2 - TE1) / T2star_min_ms)`); upstream's fixe
 segmentation (typically 3-6 NUFFTs per operator application instead of 64,
 `--num_segments 0` picks the count for `--segment_tol`); `--r_coarse_factor 2
 --r_mask` optimise the ratio image on a 2x coarser grid inside the object
-mask. Both keep the model exact to tolerance; see `decay.py`.
+mask. Both keep the model exact to tolerance; see `decay.py`. Note: with sigpy's interpolation-bound NUFFT the segmentation is not faster than 64 bins (measured in `REVIEW_JOURNAL.md`); it is the accurate option. The speed gain needs a Toeplitz normal operator.
 
 Re-running the master script resumes from the cached stage files in
 `<subject>/recon_<N>_<N>_<N>/`; delete a stage file to recompute it and

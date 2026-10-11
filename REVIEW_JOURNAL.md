@@ -226,6 +226,17 @@ Unit tests: kernel accuracy vs the exact decay, operator adjointness and
 agreement with the exact per-sample decay, finite-difference gradient through
 the parametrisation, interpolation partition of unity and adjointness.
 
+**Measured (CPU, sigpy):** the segmentation reproduces the 64-bin result
+(image NRMSE 0.000, ratio RMSE 0.001 on the reduced in-vivo subject) but is
+*not* faster with sigpy's NUFFT, which is interpolation-bound: one
+full-sample NUFFT at 128^3 costs 14.7 s of which the FFT is 0.6 s, so five
+full-sample NUFFTs cost about what 64 partial ones do (forward 98 vs 162 s,
+adjoint 87 vs 72 s at 128^3, 2 coils, 2.5 M points per coil; full toy run
+1190 vs 378 s). Expect ~1.3x at best on a GPU. The speed-up that the
+segmentation promises needs an interpolation-free (Toeplitz) normal operator
+with a gradient-based x-update, which is a solver change. Keep
+`--decay_model segments` as the accurate option, not the fast one.
+
 ### tests/
 
 1. **bug** both test modules import `pynamr` (`pynamr.TPIReadOutTime`,

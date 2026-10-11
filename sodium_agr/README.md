@@ -35,6 +35,12 @@ Unit tests: `SODIUM_AGR_BACKEND=numpy pytest tests/test_sodium_agr.py` (from the
 you want to allow (`r_min = exp(-(TE2 - TE1) / T2star_min_ms)`); upstream's fixed
 0.01 corresponds to 0.48 ms for a 2.19 ms echo spacing.
 
+`--decay_model segments` replaces the 64 time bins by a low-rank time
+segmentation (typically 3-6 NUFFTs per operator application instead of 64,
+`--num_segments 0` picks the count for `--segment_tol`); `--r_coarse_factor 2
+--r_mask` optimise the ratio image on a 2x coarser grid inside the object
+mask. Both keep the model exact to tolerance; see `decay.py`.
+
 Re-running the master script resumes from the cached stage files in
 `<subject>/recon_<N>_<N>_<N>/`; delete a stage file to recompute it and
 everything after it. `--legacy_step_sizes --legacy_init` reproduce the

@@ -16,6 +16,7 @@ import sigpy.mri
 from scipy.optimize import fmin_l_bfgs_b
 
 from .backend import device_of, to_device, to_numpy, xp
+from .decay import DecayBasis, RatioParametrisation, SegmentedDecayNUFFT, sample_times_ms
 from .operators import ApodizedNUFFT, normalized_gradient_operator
 
 
@@ -158,32 +159,32 @@ def build_time_binned_operators(coil_sens, k, field_of_view_cm: float, num_time_
     return Flist, tau
 
 
-def data_fidelity_gradient_r(x, A_1: ApodizedNUFFT, A_2: ApodizedNUFFT, d_1, d_2, residual_1=None, residual_2=None):
-    """Gradient of the dual data fidelity with respect to the ratio image.
+def data_fidelity_gradient_r(x, A_1, A_2, d_1, d_2, residual_1=None, residual_2=None):
+    """Gradient of the dual data fidelity with respect to the (fine) ratio image.
 
-    ``d/dr 0.5||A_i(r) x - d_i||^2 = sum_bins tau_b r**(tau_b-1) Re( conj(x) F_b^H (F_b(r**tau_b x) - d_b) )``
-
+    Each operator (binned or segmented) provides ``grad_r(x, residual)``;
     ``residual_i = A_i x - d_i`` may be passed to avoid recomputing the forward model.
     """
-    mod = A_1.xp
-    g_r = mod.zeros(tuple(A_1.ishape), dtype=A_1.r.dtype)
-    xc = x.conj()
+    g = None
     for A, d, res in ((A_1, d_1, residual_1), (A_2, d_2, residual_2)):
-        for i in range(A.num_time_bins):
-            s = A.bin_slice(i)
-            r_i = res[:, s, :] if res is not None else A.F(i)(A.decay_power(i) * x) - d[:, s, :]
-            g_r += A.tau[i] * A.decay_power_minus_one(i) * (xc * A.F(i).H(r_i)).real
-    return g_r
+        if res is None:
+            res = A(x) - d
+        gi = A.grad_r(x, res)
+        g = gi if g is None else g + gi
+    return g
 
 
-def r_cost_and_gradient(r_flat: np.ndarray, x, A_1: ApodizedNUFFT, A_2: ApodizedNUFFT, d_1, d_2,
-                        G: sigpy.linop.Linop, beta_r: float) -> tuple[float, np.ndarray]:
+def r_cost_and_gradient(r_flat: np.ndarray, x, A_1, A_2, d_1, d_2, G: sigpy.linop.Linop, beta_r: float,
+                        param: RatioParametrisation | None = None) -> tuple[float, np.ndarray]:
     """Cost and gradient for the L-BFGS update of the ratio image (one forward pass).
 
-    Upstream evaluated the forward model separately for the cost and for the
-    gradient; here the residual is shared, which halves the cost of each L-BFGS step.
+    With ``param`` the variables are the coarse/masked ``rho`` and ``r = param.to_fine(rho)``;
+    the gradient is mapped back with ``param.adjoint``. Upstream evaluated the forward
+    model separately for the cost and for the gradient; here the residual is shared.
     """
-    r = to_device(r_flat.reshape(tuple(A_1.ishape)), dtype=A_1.r.dtype)
+    shape = tuple(A_1.ishape) if param is None else tuple(param.coarse_shape)
+    rho = to_device(r_flat.reshape(shape), dtype=A_1.r.dtype)
+    r = rho if param is None else param.to_fine(rho)
     A_1.r = r
     A_2.r = r
     res_1 = A_1(x) - d_1
@@ -193,7 +194,25 @@ def r_cost_and_gradient(r_flat: np.ndarray, x, A_1: ApodizedNUFFT, A_2: Apodized
     Gr = G(r)
     prior = 0.5 * beta_r * float((mod.abs(Gr) ** 2).sum())
     grad = data_fidelity_gradient_r(x, A_1, A_2, d_1, d_2, res_1, res_2) + beta_r * G.H(Gr).real
+    if param is not None:
+        grad = param.adjoint(grad)
     return data_fid + prior, to_numpy(grad).astype(np.float64).ravel()
+
+
+def build_decay_operators(coil_sens, k, field_of_view_cm: float, sampling_time_us: float, TE_ms: float,
+                          delta_TE_ms: float, r, decay_model: str = "bins", num_time_bins: int = 64,
+                          num_segments: int = 0, segment_tol: float = 1e-3, r_bounds=(0.01, 1.0)):
+    """The decay-modelled operator of one echo: ``ApodizedNUFFT`` (time bins) or ``SegmentedDecayNUFFT``."""
+    if decay_model == "bins":
+        Flist, tau = build_time_binned_operators(coil_sens, k, field_of_view_cm, num_time_bins, sampling_time_us, TE_ms, delta_TE_ms)
+        return ApodizedNUFFT(Flist, r, tau)
+    if decay_model == "segments":
+        coords = to_device(np.asarray(k, dtype=np.float32) * float(field_of_view_cm))
+        F = sigpy.mri.linop.Sense(to_device(coil_sens), coords)
+        basis = DecayBasis(sample_times_ms(k.shape[0], sampling_time_us, TE_ms), delta_TE_ms, r_bounds,
+                           num_segments=num_segments, tol=segment_tol)
+        return SegmentedDecayNUFFT(F, r, basis)
+    raise ValueError(f"unknown decay_model {decay_model!r} (use 'bins' or 'segments')")
 
 
 def dual_echo_sense_with_decay_estimation(
@@ -204,6 +223,8 @@ def dual_echo_sense_with_decay_estimation(
         num_time_bins: int = 64, beta_r: float = 1e-3, r_bounds: tuple[float, float] = (0.01, 1.0),
         lbfgs_iter: int = 10, operator_norm_squared: float | None = None, legacy_step_sizes: bool = False,
         intermediate_dir: Path | str | None = None, callback: Callable | None = None, verbose: bool = True,
+        decay_model: str = "bins", num_segments: int = 0, segment_tol: float = 1e-3,
+        r_mask: np.ndarray | None = None, r_coarse_factor: int = 1,
         **kwargs) -> tuple[np.ndarray, np.ndarray]:
     """Joint dual-echo AGR with mono-exponential decay estimation (alternating).
 
@@ -221,6 +242,10 @@ def dual_echo_sense_with_decay_estimation(
       the bound; the projected gradient is zero for voxels that want to go below it.
     * ``intermediate_dir`` receives ``r_<n>.npy`` / ``x_<n>.npy`` per outer iteration;
       upstream wrote them to a temporary directory that was deleted on return.
+    * ``decay_model='segments'`` replaces the ``num_time_bins`` sample subsets by a low-rank
+      time segmentation (``num_segments`` terms, 0 = automatic for ``segment_tol``); see ``decay.py``.
+    * ``r_mask`` / ``r_coarse_factor`` optimise the ratio only inside a mask and on a grid
+      coarsened by the factor (trilinear upsampling); outside the mask ``r = 1``.
     """
     d_1 = to_device(data_1)
     d_2 = to_device(data_2)
@@ -229,25 +254,38 @@ def dual_echo_sense_with_decay_estimation(
     r = to_device(r0, dtype=np.float32 if d_1.dtype == np.complex64 else np.float64)
     dTE = TE2_ms - TE1_ms
 
-    Flist_1, tau_1 = build_time_binned_operators(coil_sens_1, k, field_of_view_cm, num_time_bins, sampling_time_us, TE1_ms, dTE)
-    Flist_2, tau_2 = build_time_binned_operators(coil_sens_2, k, field_of_view_cm, num_time_bins, sampling_time_us, TE2_ms, dTE)
-    A_1 = ApodizedNUFFT(Flist_1, r, tau_1)
-    A_2 = ApodizedNUFFT(Flist_2, r, tau_2)
+    common = dict(decay_model=decay_model, num_time_bins=num_time_bins, num_segments=num_segments,
+                  segment_tol=segment_tol, r_bounds=r_bounds)
+    A_1 = build_decay_operators(coil_sens_1, k, field_of_view_cm, sampling_time_us, TE1_ms, dTE, r, **common)
+    A_2 = build_decay_operators(coil_sens_2, k, field_of_view_cm, sampling_time_us, TE2_ms, dTE, r, **common)
+    if verbose and decay_model == "segments":
+        print(f"decay model: {A_1.num_segments} / {A_2.num_segments} SVD segments per echo "
+              f"(kernel error {A_1.basis.rel_error:.1e} / {A_2.basis.rel_error:.1e}) instead of {num_time_bins} bins")
+    param = None
+    if r_mask is not None or r_coarse_factor > 1:
+        param = RatioParametrisation(tuple(A_1.ishape), mask=r_mask, factor=r_coarse_factor, r_outside=1.0,
+                                     bounds=r_bounds, backend=A_1.xp)
+        if verbose:
+            print(f"ratio image optimised on {param.coarse_shape} ({param.num_parameters} parameters"
+                  f"{', masked' if r_mask is not None else ''}) instead of {int(np.prod(A_1.ishape))}")
     prox, _ = _prox_and_cost(regularization, beta, G.oshape)
 
     if intermediate_dir is not None:
         intermediate_dir = Path(intermediate_dir)
         intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    bounds = int(r.size) * [tuple(r_bounds)]
+    rho = to_numpy(r).astype(np.float64) if param is None else param.initial_rho(r)
+    bounds = int(rho.size) * [tuple(r_bounds)]
     r_new = r
     for i_outer in range(max_outer_iter):
         if verbose:
             print(f"dual echo AGR with decay estimation, outer iteration {i_outer + 1:03d} / {max_outer_iter:03d}")
-        res = fmin_l_bfgs_b(r_cost_and_gradient, to_numpy(A_1.r).astype(np.float64).ravel(),
-                            args=(x, A_1, A_2, d_1, d_2, G, beta_r), maxiter=lbfgs_iter,
+        res = fmin_l_bfgs_b(r_cost_and_gradient, rho.ravel(),
+                            args=(x, A_1, A_2, d_1, d_2, G, beta_r, param), maxiter=lbfgs_iter,
                             bounds=bounds, disp=1 if verbose else 0)
-        r_new = to_device(res[0].reshape(tuple(A_1.ishape)), dtype=r.dtype)
+        rho = res[0].reshape(rho.shape)
+        rho_d = to_device(rho, dtype=r.dtype)
+        r_new = rho_d if param is None else param.to_fine(rho_d)
         A_1.r = r_new
         A_2.r = r_new
 

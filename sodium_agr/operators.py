@@ -117,6 +117,14 @@ class ApodizedNUFFT(sigpy.linop.Linop):
     def get_Ai(self, i: int):  # upstream name, kept
         return self._Flist[i] * sigpy.linop.Multiply(self.ishape, self._powers[i])
 
+    def grad_r(self, x, residual):
+        """``d/dr 0.5||A(r) x - d||^2 = sum_bins tau_b r**(tau_b-1) Re( conj(x) F_b^H residual_b )``."""
+        xc = x.conj()
+        g = self._xp.zeros(tuple(self.ishape), dtype=self._r.dtype)
+        for i, F in enumerate(self._Flist):
+            g += self._tau[i] * self.decay_power_minus_one(i) * (xc * F.H(residual[:, self._split[i], :])).real
+        return g
+
     # ---- Linop interface --------------------------------------------------
     def _apply(self, input):
         y = self._xp.zeros(tuple(self.oshape), dtype=input.dtype)

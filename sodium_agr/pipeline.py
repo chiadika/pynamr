@@ -28,6 +28,7 @@ from .backend import BACKEND_NAME, to_device, to_numpy, xp
 from .coils_sens import calculate_csm_inati_iter, calculate_sense_scale
 from .operators import projected_gradient_operator
 from .preprocessing import read_converted_data_h5, read_kspace_trajectory_h5
+from .decay import object_mask
 from .reconstruction import (channelwise_ifft_recon, channelwise_lsq_recon,
                              dual_echo_sense_with_decay_estimation, regularized_sense_recon)
 from .registration import align_images
@@ -50,6 +51,11 @@ class ReconConfig:
     inner_iter_decay: int = 100                # PDHG iterations per outer iteration, stage 8
     lbfgs_iter: int = 10                       # L-BFGS iterations per outer iteration, stage 8
     num_time_bins: int = 64
+    decay_model: str = "bins"                  # 'bins' (upstream) or 'segments' (low-rank time segmentation)
+    num_segments: int = 0                      # SVD terms for 'segments'; 0 = automatic for segment_tol
+    segment_tol: float = 1e-3
+    r_coarse_factor: int = 1                   # optimise the ratio image on a grid coarsened by this factor
+    r_mask: bool = False                       # optimise the ratio only inside the object mask of the echo-1 AGR
     r_bounds: tuple[float, float] = (0.01, 1.0)
     t2star_min_ms: float | None = None         # if set, the lower ratio bound becomes exp(-(TE2 - TE1) / t2star_min_ms)
     csm_smoothing: int = 7
@@ -186,7 +192,8 @@ def run(cfg: ReconConfig) -> dict:
     r0 = initial_ratio(agr_2["x"], agr_1["x"])
     num_data = int(np.size(data_1))
     u0 = np.concatenate((agr_1["u"][:num_data], agr_2["u"][:num_data], agr_1["u"][num_data:]))
-    name = f"dual_echo_agr_w_decay_{tag}_br{cfg.beta_r:.2E}_n{cfg.max_outer_iter_agr}"
+    fast = ("_seg" if cfg.decay_model == "segments" else "") + (f"_rc{cfg.r_coarse_factor}" if cfg.r_coarse_factor > 1 else "") + ("_rm" if cfg.r_mask else "")
+    name = f"dual_echo_agr_w_decay_{tag}_br{cfg.beta_r:.2E}_n{cfg.max_outer_iter_agr}{fast}"
     final = Stage(out / f"{name}.npz").get(lambda: _stage_decay(data_1, data_2, params, maps_1, maps_2, k, agr_1["x"], u0, r0, PG, cfg, out, name))
     return dict(x=final["x"], r=final["r"], anat_aligned=anat_aligned, output_path=out, data_norm=norm)
 
@@ -277,6 +284,8 @@ def _stage_decay(data_1, data_2, params, maps_1, maps_2, k, x0, u0, r0, PG, cfg,
         max_iter=cfg.inner_iter_decay, max_outer_iter=cfg.max_outer_iter_agr, num_time_bins=cfg.num_time_bins,
         beta_r=cfg.beta_r, r_bounds=cfg.effective_r_bounds, lbfgs_iter=cfg.lbfgs_iter,
         legacy_step_sizes=cfg.legacy_step_sizes,
+        decay_model=cfg.decay_model, num_segments=cfg.num_segments, segment_tol=cfg.segment_tol,
+        r_mask=object_mask(x0) if cfg.r_mask else None, r_coarse_factor=cfg.r_coarse_factor,
         intermediate_dir=(out / f"{name}_intermediates") if cfg.save_intermediates else None)
     nib.save(nib.Nifti1Image(np.abs(x).astype(np.float32), cfg.output_affine), out / f"{name}.nii")
     nib.save(nib.Nifti1Image(np.abs(r).astype(np.float32), cfg.output_affine), out / f"{name}_r.nii")

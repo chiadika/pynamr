@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inner_iter_decay", type=int, default=d.inner_iter_decay, help="PDHG iterations per outer iteration")
     p.add_argument("--lbfgs_iter", type=int, default=d.lbfgs_iter, help="L-BFGS iterations per ratio update")
     p.add_argument("--num_time_bins", type=int, default=d.num_time_bins, help="readout time bins of the decay model")
+    p.add_argument("--decay_model", choices=("bins", "segments"), default=d.decay_model,
+                   help="'bins': upstream time bins; 'segments': low-rank time segmentation (fewer NUFFTs)")
+    p.add_argument("--num_segments", type=int, default=d.num_segments, help="SVD terms for --decay_model segments (0 = automatic)")
+    p.add_argument("--segment_tol", type=float, default=d.segment_tol, help="relative kernel error of the automatic segment count")
+    p.add_argument("--r_coarse_factor", type=int, default=d.r_coarse_factor, help="optimise the ratio image on a grid coarsened by this factor")
+    p.add_argument("--r_mask", action="store_true", help="optimise the ratio only inside the object mask (r = 1 outside)")
     p.add_argument("--r_bounds", type=float, nargs=2, default=list(d.r_bounds), metavar=("RMIN", "RMAX"),
                    help="bounds of the ratio image exp(-dTE/T2*); lower it for short T2* (proton UTE)")
     p.add_argument("--T2star_min_ms", dest="t2star_min_ms", type=float, default=None,

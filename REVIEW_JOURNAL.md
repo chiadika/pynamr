@@ -198,6 +198,34 @@ End-to-end check (CPU, numpy backend): a 16^3 two-coil two-compartment phantom
 with decay ratios 0.5 / 0.9 reconstructs to median ratios 0.51 / 0.91 after
 3 outer iterations.
 
+### decay.py (new): faster decay modelling
+
+Two accelerations of the joint stage, both exact to a tolerance and both
+optional (`--decay_model segments`, `--r_coarse_factor`, `--r_mask`):
+
+1. **Low-rank time segmentation.** Upstream models the in-readout decay with
+   64 sample bins, each a full (SENSE-)NUFFT with its own oversampled FFT, so
+   one operator application costs 64 FFTs per coil. `DecayBasis` takes the
+   SVD of `exp(-t_j R)` over the sample times and a log grid of `R = -ln r /
+   dTE` spanning the ratio bounds; `SegmentedDecayNUFFT` applies `sum_k C_k
+   F(psi_k(r) x)`. For our readout (312 x 5 us, TE 80 us, dTE 2.19 ms) and
+   T2* down to 0.05 ms, **5 terms** give a 4e-4 relative kernel error; with
+   upstream's bounds (T2* >= 0.48 ms) 3 terms suffice. The ratio gradient is
+   `sum_k dpsi_k/dr Re(conj(x) F^H C_k res)` with `dpsi/dR` tabulated on the grid
+   (accurate to ~1e-3 for T2* > 0.3 ms, ~5 % below that, where the signal is
+   gone anyway). Same mathematics as Fessler & Sutton's time-segmented NUFFT
+   for field maps.
+2. **Coarse, masked ratio.** `RatioParametrisation`: `r = mask * U rho + (1 -
+   mask)`, `U` trilinear upsampling (sigpy `Interpolate`, exact adjoint), rho on
+   a grid coarsened by `r_coarse_factor`; L-BFGS-B runs on rho with the same
+   bounds. The quadratic prior on r makes it smooth, so factor 2 changes
+   nothing visible while dividing the L-BFGS problem by 8 (and by the
+   mask fraction on top).
+
+Unit tests: kernel accuracy vs the exact decay, operator adjointness and
+agreement with the exact per-sample decay, finite-difference gradient through
+the parametrisation, interpolation partition of unity and adjointness.
+
 ### tests/
 
 1. **bug** both test modules import `pynamr` (`pynamr.TPIReadOutTime`,

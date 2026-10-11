@@ -106,3 +106,68 @@ def test_initial_ratio_handles_zero_denominator():
     a2 = 0.5 * a1
     r0 = initial_ratio(a2, a1)
     assert np.isfinite(r0).all() and r0[3, 3, 3] == 1.0 and r0[4, 4, 4] == 0.5 and r0[0, 0, 0] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# fast decay model (decay.py)
+# ---------------------------------------------------------------------------
+from sodium_agr import decay  # noqa: E402
+
+
+def test_decay_basis_matches_exact_kernel():
+    t = decay.sample_times_ms(312, 5.0, 0.08)
+    basis = decay.DecayBasis(t, 2.19, (np.exp(-2.19 / 0.05), 1.0), tol=1e-3)
+    rng = np.random.default_rng(4)
+    r = np.exp(-2.19 / rng.uniform(0.05, 50.0, 2000))          # T2* from 0.05 to 50 ms
+    psi = basis.psi_of_r(r)                                    # (K, 2000)
+    approx = basis.c @ psi                                      # (312, 2000)
+    exact = r[None, :] ** (t[:, None] / 2.19)
+    rel = np.linalg.norm(approx - exact) / np.linalg.norm(exact)
+    assert basis.num_segments <= 32 and rel < 5e-3, (basis.num_segments, rel)
+    # derivative check
+    _, dpsi = basis.psi_of_r(r, derivative=True)
+    eps = 1e-6 * r
+    fd = (basis.psi_of_r(r + eps) - basis.psi_of_r(r - eps)) / (2 * eps)
+    good = (r > 1e-3)                                            # T2* > 0.32 ms; below, the log-grid derivative is ~5 % off
+    rel = np.abs(dpsi[:, good] - fd[:, good]) / (np.abs(fd[:, good]) + 1e-3 * np.abs(fd[:, good]).max())
+    assert np.median(rel) < 5e-3 and np.percentile(rel, 99) < 5e-2, (np.median(rel), np.percentile(rel, 99))
+
+
+def test_segmented_decay_nufft_adjoint_and_gradient():
+    rng = np.random.default_rng(5)
+    N, fov, ncoils = 6, 10.0, 2
+    k = _radial_k(points=8, readouts=24)
+    sens = (rng.standard_normal((ncoils, N, N, N)) + 1j * rng.standard_normal((ncoils, N, N, N))).astype(np.complex64)
+    r = rng.uniform(0.3, 1.0, (N, N, N)).astype(np.float64)
+    A = reconstruction.build_decay_operators(sens, k, fov, 5.0, 0.08, 2.0, r, decay_model="segments", segment_tol=1e-4)
+    x = (rng.standard_normal((N, N, N)) + 1j * rng.standard_normal((N, N, N))).astype(np.complex128)
+    y = (rng.standard_normal(tuple(A.oshape)) + 1j * rng.standard_normal(tuple(A.oshape))).astype(np.complex128)
+    assert abs(np.vdot(y, A(x)) - np.vdot(A.H(y), x)) < 1e-6 * abs(np.vdot(y, A(x)))
+    # agrees with the exact per-sample decay through the same Sense operator
+    exact = np.zeros(tuple(A.oshape), np.complex128)
+    for j in range(k.shape[0]):
+        exact[:, j, :] = A.F(A.basis.exact_decay(r, j) * x)[:, j, :]
+    assert np.linalg.norm(A(x) - exact) < 1e-3 * np.linalg.norm(exact)
+    # ratio gradient by finite differences (segments) with the coarse/masked parametrisation
+    A2 = reconstruction.build_decay_operators(sens, k, fov, 5.0, 2.08, 2.0, r, decay_model="segments", segment_tol=1e-4)
+    d1 = A(x) * 0.8; d2 = A2(x) * 0.8
+    G = operators.normalized_gradient_operator((N, N, N))
+    mask = np.ones((N, N, N), bool); mask[0] = False
+    param = decay.RatioParametrisation((N, N, N), mask=mask, factor=2, bounds=(0.01, 1.0))
+    rho = param.initial_rho(r)
+    c0, g = reconstruction.r_cost_and_gradient(rho.ravel(), x, A, A2, d1, d2, G, beta_r=0.1, param=param)
+    for i in rng.integers(0, rho.size, 4):
+        rp = rho.ravel().copy(); rp[i] += 1e-5
+        c1, _ = reconstruction.r_cost_and_gradient(rp, x, A, A2, d1, d2, G, beta_r=0.1, param=param)
+        fd = (c1 - c0) / 1e-5
+        assert abs(fd - g[i]) < 2e-2 * max(1.0, abs(fd)), (fd, g[i])
+
+
+def test_ratio_parametrisation_is_an_interpolation_with_exact_adjoint():
+    rng = np.random.default_rng(6)
+    param = decay.RatioParametrisation((9, 9, 9), factor=3, bounds=(0.0, 2.0))
+    rho = np.full(param.coarse_shape, 0.7)
+    r = param.to_fine(rho)
+    assert np.allclose(r[2:-2, 2:-2, 2:-2], 0.7, atol=1e-6)      # partition of unity in the interior
+    a = rng.standard_normal(param.coarse_shape); b = rng.standard_normal((9, 9, 9))
+    assert abs(np.vdot(param.U(a), b) - np.vdot(a, param.U.H(b))) < 1e-9
